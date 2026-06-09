@@ -1,8 +1,10 @@
 # ============================================================
-# NESYAN — Cognitive Decline FastAPI Service
-# POST /predict → parse frontend JSON, run model, save to DB, return result
-# GET /predict/{id} → fetch latest result for a patient from DB
+#  NESYAN — Cognitive Decline FastAPI Service v3
+#  POST /predict        → run model, save to DB, return result
+#  GET  /predict/{id}   → fetch latest result from DB
+#  GET  /health         → service health check
 # ============================================================
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from typing import List
@@ -18,29 +20,40 @@ from datetime import datetime, timezone
 # ============================================================
 # LOAD MODEL
 # ============================================================
-MODEL_PATH = os.getenv("MODEL_PATH", "alzheimers_model.pkl")
+
+MODEL_PATH = os.getenv("MODEL_PATH", "alzheimers_model_v3.pkl")
+
 try:
     model = joblib.load(MODEL_PATH)
 except FileNotFoundError:
     raise RuntimeError(f"Model file not found: {MODEL_PATH}. Run the notebook first.")
 
 # ============================================================
-# DATABASE SETUP (SQLite — zero config, works on Render free tier)
+# SHAP EXPLAINER
 # ============================================================
+
+explainer = shap.TreeExplainer(model)
+
+# ============================================================
+# DATABASE SETUP  (SQLite)
+# ============================================================
+
 DB_PATH = os.getenv("DB_PATH", "nesyan.db")
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-    CREATE TABLE IF NOT EXISTS predictions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    patient_id TEXT NOT NULL,
-    prediction TEXT NOT NULL,
-    confidence REAL NOT NULL,
-    probabilities TEXT NOT NULL, -- JSON string
-    alert TEXT NOT NULL,
-    predicted_at TEXT NOT NULL
-    )
+        CREATE TABLE IF NOT EXISTS predictions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id    TEXT    NOT NULL,
+            prediction    TEXT    NOT NULL,
+            confidence    REAL    NOT NULL,
+            risk_score    INTEGER NOT NULL,
+            probabilities TEXT    NOT NULL,
+            alert         TEXT    NOT NULL,
+            explanation   TEXT    NOT NULL,
+            predicted_at  TEXT    NOT NULL
+        )
     """)
     con.commit()
     con.close()
@@ -50,9 +63,10 @@ init_db()
 def save_result(patient_id: str, result: dict):
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-    INSERT INTO predictions
-    (patient_id, prediction, confidence, probabilities, alert, predicted_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO predictions
+            (patient_id, prediction, confidence, risk_score,
+             probabilities, alert, explanation, predicted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         patient_id,
         result["prediction"],
@@ -69,21 +83,24 @@ def save_result(patient_id: str, result: dict):
 def fetch_latest(patient_id: str) -> dict | None:
     con = sqlite3.connect(DB_PATH)
     row = con.execute("""
-    SELECT patient_id, prediction, confidence, probabilities, alert, predicted_at
-    FROM predictions
-    WHERE patient_id = ?
-    ORDER BY id DESC LIMIT 1
+        SELECT patient_id, prediction, confidence, risk_score,
+               probabilities, alert, explanation, predicted_at
+        FROM predictions
+        WHERE patient_id = ?
+        ORDER BY id DESC LIMIT 1
     """, (patient_id,)).fetchone()
     con.close()
     if not row:
         return None
     return {
-        "patient_id": row[0],
-        "prediction": row[1],
-        "confidence": row[2],
-        "probabilities": json.loads(row[3]),
-        "alert": row[4],
-        "predicted_at": row[5],
+        "patient_id":    row[0],
+        "prediction":    row[1],
+        "confidence":    row[2],
+        "risk_score":    row[3],
+        "probabilities": json.loads(row[4]),
+        "alert":         row[5],
+        "explanation":   json.loads(row[6]),
+        "predicted_at":  row[7],
     }
 
 # ============================================================
@@ -156,15 +173,16 @@ def build_alert(prediction: str, score_slope: float) -> str:
 # ============================================================
 # SCHEMAS
 # ============================================================
+
 class Session(BaseModel):
     session_id: int
-    score: float
+    score:      float
     time_taken: float
 
 class PredictRequest(BaseModel):
-    patient_id: str = Field(..., description="Unique patient identifier")
-    date: str = Field(..., description="Date of assessment (YYYY-MM-DD)")
-    sessions: List[Session] = Field(..., description="3 Mind Game sessions")
+    patient_id: str           = Field(..., description="Unique patient identifier")
+    date:       str           = Field(..., description="Date of assessment (YYYY-MM-DD)")
+    sessions:   List[Session] = Field(..., description="3 Mind Game sessions")
 
     @field_validator("sessions")
     @classmethod
@@ -176,139 +194,131 @@ class PredictRequest(BaseModel):
 class Probabilities(BaseModel):
     declining: float
     improving: float
-    stable: float
+    stable:    float
+
+class ShapFeature(BaseModel):
+    feature: str
+    impact:  float
 
 class PredictResponse(BaseModel):
-    patient_id: str
-    prediction: str
-    confidence: float
+    patient_id:    str
+    prediction:    str
+    confidence:    float
+    risk_score:    int                  # ✅ Bug #2 Fix — was missing in v2
     probabilities: Probabilities
-    alert: str
-    predicted_at: str
-
-# ============================================================
-# FEATURE ENGINEERING (must match notebook exactly)
-# ============================================================
-FEATURE_NAMES = [
-    "mean_score", "score_slope", "score_std", "score_range",
-    "mean_time", "time_slope",
-]
-
-def extract_features(scores: list, time: list) -> list:
-    t = list(range(len(scores)))
-    return [
-        float(np.mean(scores)),
-        float(np.polyfit(t, scores, 1)[0]), # score_slope — top feature
-        float(np.std(scores)),
-        float(max(scores) - min(scores)),
-        float(np.mean(time)),
-        float(np.polyfit(t, time, 1)[0]), # time_slope
-    ]
-
-# ============================================================
-# ALERT LOGIC
-# ============================================================
-def build_alert(prediction: str, score_slope: float) -> str:
-    if score_slope < -2:
-        return "CRITICAL: Rapid cognitive decline — immediate clinical review recommended"
-    if prediction == "declining":
-        return "WARNING: Cognitive decline detected — schedule follow-up assessment"
-    if prediction == "improving":
-        return "POSITIVE: Cognitive improvement observed — continue current care plan"
-    return "STABLE: No significant cognitive change detected"
+    alert:         str
+    explanation:   List[ShapFeature]   # ✅ Bug #2 Fix — was missing in v2
+    predicted_at:  str
 
 # ============================================================
 # APP
 # ============================================================
+
 app = FastAPI(
-    title="NESYAN — Cognitive Decline API",
-    description="Predicts cognitive state (declining / improving / stable) from Mind Game session data.",
-    version="2.0.0",
+    title       = "NESYAN — Cognitive Decline API",
+    description = "Predicts cognitive state with Risk Score and SHAP explainability.",
+    version     = "3.0.0",
 )
 
 # ============================================================
 # ENDPOINTS
 # ============================================================
+
 @app.post(
     "/predict",
-    response_model=PredictResponse,
-    summary="Run prediction for a patient",
-    tags=["Prediction"],
+    response_model = PredictResponse,
+    summary        = "Run prediction for a patient",
+    tags           = ["Prediction"],
 )
 def predict(req: PredictRequest) -> PredictResponse:
     """
-    Accepts the frontend JSON (patient_id, date, sessions),
-    runs the model, saves the result to the database, and returns it.
-    Expected body:
+    Accepts frontend JSON, runs model, saves to DB, returns result.
+
     ```json
     {
-    "patient_id": "1",
-    "date": "2026-05-22",
-    "sessions": [
-    { "session_id": 1, "score": 90, "time_taken": 20 },
-    { "session_id": 2, "score": 70, "time_taken": 35 },
-    { "session_id": 3, "score": 40, "time_taken": 60 }
-    ]
+      "patient_id": "1",
+      "date": "2026-05-22",
+      "sessions": [
+        { "session_id": 1, "score": 90, "time_taken": 20 },
+        { "session_id": 2, "score": 70, "time_taken": 35 },
+        { "session_id": 3, "score": 40, "time_taken": 60 }
+      ]
     }
     ```
     """
-    # Sort sessions by session_id to guarantee order
-    sessions = sorted(req.sessions, key=lambda s: s.session_id)
-    scores = [s.score for s in sessions]
-    time = [s.time_taken for s in sessions]
+    sessions    = sorted(req.sessions, key=lambda s: s.session_id)
+    scores      = [s.score      for s in sessions]
+    time        = [s.time_taken for s in sessions]
 
-    # Extract features & predict
-    features = extract_features(scores, time)
-    X = pd.DataFrame([features], columns=FEATURE_NAMES)
-    prediction = model.predict(X)[0]
-    proba_arr = model.predict_proba(X)[0]
-    proba_dict = {cls: round(float(p), 4) for cls, p in zip(model.classes_, proba_arr)}
-    confidence = round(float(max(proba_arr)), 4)
-    score_slope = features[1]
-    alert = build_alert(prediction, score_slope)
+    features    = extract_features(scores, time)
+    X           = pd.DataFrame([features], columns=FEATURE_NAMES)
+    prediction  = model.predict(X)[0]
+    proba_arr   = model.predict_proba(X)[0]
+    proba_dict  = {cls: round(float(p), 4) for cls, p in zip(model.classes_, proba_arr)}
+    confidence  = round(float(max(proba_arr)), 4)
+    risk_score  = calculate_risk_score(proba_dict)
+    score_slope = features[4]   # ✅ Bug #1 Fix — index 4 = score_slope (was features[1] = median_score)
+    alert       = build_alert(prediction, score_slope)
+
+    # SHAP — top 3 reasons
+    sv        = explainer.shap_values(X)
+    ci        = list(model.classes_).index(prediction)
+    shap_row  = sv[0, :, ci]
+    top_shap  = sorted(zip(FEATURE_NAMES, shap_row),
+                       key=lambda x: abs(x[1]), reverse=True)[:3]
+    explanation = [{"feature": f, "impact": round(float(v), 4)} for f, v in top_shap]
+
     predicted_at = datetime.now(timezone.utc).isoformat()
 
     result = {
-        "patient_id": req.patient_id,
-        "prediction": prediction,
-        "confidence": confidence,
+        "patient_id":    req.patient_id,
+        "prediction":    prediction,
+        "confidence":    confidence,
+        "risk_score":    risk_score,
         "probabilities": proba_dict,
-        "alert": alert,
-        "predicted_at": predicted_at,
+        "alert":         alert,
+        "explanation":   explanation,
+        "predicted_at":  predicted_at,
     }
 
     save_result(req.patient_id, result)
 
     return PredictResponse(
-        patient_id=result["patient_id"],
-        prediction=result["prediction"],
-        confidence=result["confidence"],
-        probabilities=Probabilities(**result["probabilities"]),
-        alert=result["alert"],
-        predicted_at=result["predicted_at"],
+        patient_id    = result["patient_id"],
+        prediction    = result["prediction"],
+        confidence    = result["confidence"],
+        risk_score    = result["risk_score"],
+        probabilities = Probabilities(**result["probabilities"]),
+        alert         = result["alert"],
+        explanation   = [ShapFeature(**e) for e in result["explanation"]],
+        predicted_at  = result["predicted_at"],
     )
+
 
 @app.get(
     "/predict/{patient_id}",
-    response_model=PredictResponse,
-    summary="Get latest prediction for a patient",
-    tags=["Prediction"],
+    response_model = PredictResponse,
+    summary        = "Get latest prediction for a patient",
+    tags           = ["Prediction"],
 )
 def get_latest(patient_id: str) -> PredictResponse:
     row = fetch_latest(patient_id)
     if not row:
         raise HTTPException(
-            status_code=404,
-            detail=f"No prediction found for patient_id '{patient_id}'"
+            status_code = 404,
+            detail      = f"No prediction found for patient_id '{patient_id}'"
         )
     return PredictResponse(
-        patient_id=row["patient_id"],
-        prediction=row["prediction"],
-        confidence=row["confidence"],
-        probabilities=Probabilities(**row["probabilities"]),
-        alert=row["alert"],
-        predicted_at=row["predicted_at"],
+        patient_id    = row["patient_id"],
+        prediction    = row["prediction"],
+        confidence    = row["confidence"],
+        risk_score    = row["risk_score"],
+        probabilities = Probabilities(**row["probabilities"]),
+        alert         = row["alert"],
+        explanation   = [ShapFeature(**e) for e in row["explanation"]],
+        predicted_at  = row["predicted_at"],
     )
+
 
 @app.get("/health", tags=["System"])
 def health():
