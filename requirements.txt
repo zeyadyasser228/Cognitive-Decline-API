@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
-numpy
+numpy<2
 pandas
 scikit-learn
 shap

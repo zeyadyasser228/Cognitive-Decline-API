@@ -55,6 +55,17 @@ def init_db():
             predicted_at  TEXT    NOT NULL
         )
     """)
+    
+    # Run migrations if upgrading from an older database schema (v2 -> v3)
+    cursor = con.cursor()
+    cursor.execute("PRAGMA table_info(predictions)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if "risk_score" not in columns:
+        con.execute("ALTER TABLE predictions ADD COLUMN risk_score INTEGER NOT NULL DEFAULT 0")
+    if "explanation" not in columns:
+        con.execute("ALTER TABLE predictions ADD COLUMN explanation TEXT NOT NULL DEFAULT '[]'")
+        
     con.commit()
     con.close()
 
